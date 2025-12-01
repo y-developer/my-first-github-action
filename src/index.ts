@@ -163,12 +163,16 @@ class GiteaClient {
 
             // Add labels if provided and labeling is not skipped
             if (pr.labels && pr.labels.length > 0) {
-                await this.octokit.issues.addLabels({
-                    owner: this.owner,
-                    repo: this.repo,
-                    issue_number: response.data.number,
-                    labels: pr.labels,
-                });
+                try {
+                    await this.octokit.issues.addLabels({
+                        owner: this.owner,
+                        repo: this.repo,
+                        issue_number: response.data.number,
+                        labels: pr.labels,
+                    });
+                } catch (labelError) {
+                    core.warning(`Failed to add labels: ${labelError}`);
+                }
             }
 
             return {
@@ -176,20 +180,40 @@ class GiteaClient {
                 number: response.data.number,
                 url: response.data.html_url,
             };
-        } catch (error) {
-            core.error(`Failed to create pull request: ${error}`);
+        } catch (error: any) {
+            core.error(`Failed to create pull request: ${error.message}`);
+            // Check if the issue is related to repository settings
+            if (error.message && error.message.includes("Can't read pulls")) {
+                core.error('Pull requests may be disabled in repository settings. Please enable pull requests in your Gitea repository settings.');
+            }
             throw error;
         }
     }
 
     async getLatestRelease(): Promise<{ tag_name: string } | null> {
         try {
+            // Try to get the latest release
             const response = await this.octokit.repos.getLatestRelease({
                 owner: this.owner,
                 repo: this.repo,
             });
             return { tag_name: response.data.tag_name };
-        } catch (error) {
+        } catch (error: any) {
+            // If 404, try listing all releases and get the first one
+            if (error.status === 404) {
+                try {
+                    const releases = await this.octokit.repos.listReleases({
+                        owner: this.owner,
+                        repo: this.repo,
+                        per_page: 1,
+                    });
+                    if (releases.data.length > 0) {
+                        return { tag_name: releases.data[0].tag_name };
+                    }
+                } catch (listError) {
+                    core.debug('No releases found');
+                }
+            }
             // No releases found
             return null;
         }
@@ -255,15 +279,34 @@ class GiteaClient {
 
     async createRef(ref: string, sha: string): Promise<void> {
         try {
+            // Gitea might use a different endpoint for creating branches
+            // Try the git ref creation first
             await this.octokit.git.createRef({
                 owner: this.owner,
                 repo: this.repo,
                 ref: `refs/heads/${ref}`,
                 sha,
             });
-        } catch (error) {
-            core.error(`Failed to create ref: ${error}`);
-            throw error;
+        } catch (error: any) {
+            // If that fails, try using repos.createBranch if available
+            if (error.status === 405 || error.status === 404) {
+                try {
+                    // Alternative: Create branch using Gitea's specific endpoint
+                    const response = await this.octokit.request('POST /repos/{owner}/{repo}/branches', {
+                        owner: this.owner,
+                        repo: this.repo,
+                        new_branch_name: ref,
+                        old_branch_name: 'main', // or get from default branch
+                    });
+                    core.debug(`Branch created using alternative method: ${response.status}`);
+                } catch (altError: any) {
+                    core.error(`Failed to create ref with alternative method: ${altError.message}`);
+                    throw altError;
+                }
+            } else {
+                core.error(`Failed to create ref: ${error.message}`);
+                throw error;
+            }
         }
     }
 }
@@ -364,30 +407,41 @@ export async function main() {
         if (!inputs.skipGiteaPullRequest) {
             core.info('Creating pull request');
 
-            const nextVersion = inputs.releaseAs ||
-                await determineNextVersion(client, inputs.versioningStrategy);
-
-            const branch = await client.getBranch(inputs.targetBranch);
-            const releaseBranchName = `release-please--${inputs.targetBranch}--${nextVersion}`;
-
+            // Check if pull requests are enabled by testing repository settings
             try {
-                await client.createRef(releaseBranchName, branch.commit.sha);
-            } catch (error) {
-                core.warning(`Branch ${releaseBranchName} may already exist`);
+                const nextVersion = inputs.releaseAs ||
+                    await determineNextVersion(client, inputs.versioningStrategy);
+
+                const branch = await client.getBranch(inputs.targetBranch);
+                const releaseBranchName = `release-please--${inputs.targetBranch}--${nextVersion}`;
+
+                // Try to create the branch
+                try {
+                    await client.createRef(releaseBranchName, branch.commit.sha);
+                    core.info(`Created branch: ${releaseBranchName}`);
+                } catch (error: any) {
+                    core.warning(`Could not create branch ${releaseBranchName}: ${error.message}`);
+                    core.info('Skipping PR creation - branch creation failed');
+                    return;
+                }
+
+                const pr: PullRequest = {
+                    number: 0,
+                    title: `chore: release ${nextVersion}`,
+                    body: `Release ${nextVersion}\n\nThis PR was generated by release-please for Gitea.`,
+                    headBranchName: releaseBranchName,
+                    baseBranchName: inputs.targetBranch,
+                    url: '',
+                    labels: inputs.skipLabeling ? [] : ['autorelease: pending'],
+                };
+
+                const createdPR = await client.createPullRequest(pr);
+                outputPRs([createdPR]);
+            } catch (error: any) {
+                core.error(`PR creation failed: ${error.message}`);
+                core.warning('Pull requests may not be enabled in repository settings. Continuing with release only.');
+                // Don't fail the entire action if PR creation fails
             }
-
-            const pr: PullRequest = {
-                number: 0,
-                title: `chore: release ${nextVersion}`,
-                body: `Release ${nextVersion}\n\nThis PR was generated by release-please for Gitea.`,
-                headBranchName: releaseBranchName,
-                baseBranchName: inputs.targetBranch,
-                url: '',
-                labels: inputs.skipLabeling ? [] : ['autorelease: pending'],
-            };
-
-            const createdPR = await client.createPullRequest(pr);
-            outputPRs([createdPR]);
         }
 
         core.info('Release-please process completed successfully');
