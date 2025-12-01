@@ -1,0 +1,15 @@
+{
+    "name": "my-typescript-action",
+    "version": "1.0.0",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc"
+    },
+    "dependencies": {
+        "@actions/core": "^1.10.0"
+    },
+    "devDependencies": {
+        "@types/node": "^24.10.1",
+        "typescript": "^5.0.0"
+    }
+}

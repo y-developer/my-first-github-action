@@ -1,0 +1,12 @@
+name: "My TypeScript Action"
+description: "A simple demo action"
+author: "You"
+
+inputs:
+  name:
+    description: "Your name"
+    required: true
+
+runs:
+  using: "node20"
+  main: "dist/index.js"
