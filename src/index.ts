@@ -279,34 +279,31 @@ class GiteaClient {
 
     async createRef(ref: string, sha: string): Promise<void> {
         try {
-            // Gitea might use a different endpoint for creating branches
-            // Try the git ref creation first
-            await this.octokit.git.createRef({
+            // Gitea uses POST /repos/{owner}/{repo}/branches endpoint
+            // It requires creating from an existing branch, not a commit SHA
+            const response = await this.octokit.request('POST /repos/{owner}/{repo}/branches', {
                 owner: this.owner,
                 repo: this.repo,
-                ref: `refs/heads/${ref}`,
-                sha,
+                new_branch_name: ref,
+                old_branch_name: await this.getDefaultBranch(),
             });
+            core.debug(`Branch created: ${response.status}`);
         } catch (error: any) {
-            // If that fails, try using repos.createBranch if available
-            if (error.status === 405 || error.status === 404) {
-                try {
-                    // Alternative: Create branch using Gitea's specific endpoint
-                    const response = await this.octokit.request('POST /repos/{owner}/{repo}/branches', {
-                        owner: this.owner,
-                        repo: this.repo,
-                        new_branch_name: ref,
-                        old_branch_name: 'main', // or get from default branch
-                    });
-                    core.debug(`Branch created using alternative method: ${response.status}`);
-                } catch (altError: any) {
-                    core.error(`Failed to create ref with alternative method: ${altError.message}`);
-                    throw altError;
-                }
-            } else {
-                core.error(`Failed to create ref: ${error.message}`);
-                throw error;
-            }
+            core.error(`Failed to create branch: ${error.message}`);
+            throw error;
+        }
+    }
+
+    async getDefaultBranch(): Promise<string> {
+        try {
+            const response = await this.octokit.repos.get({
+                owner: this.owner,
+                repo: this.repo,
+            });
+            return response.data.default_branch || 'main';
+        } catch (error: any) {
+            core.warning(`Failed to get default branch, using 'main': ${error.message}`);
+            return 'main';
         }
     }
 }
@@ -412,12 +409,11 @@ export async function main() {
                 const nextVersion = inputs.releaseAs ||
                     await determineNextVersion(client, inputs.versioningStrategy);
 
-                const branch = await client.getBranch(inputs.targetBranch);
                 const releaseBranchName = `release-please--${inputs.targetBranch}--${nextVersion}`;
 
-                // Try to create the branch
+                // Try to create the branch (note: sha is not used in Gitea's API)
                 try {
-                    await client.createRef(releaseBranchName, branch.commit.sha);
+                    await client.createRef(releaseBranchName, '');
                     core.info(`Created branch: ${releaseBranchName}`);
                 } catch (error: any) {
                     core.warning(`Could not create branch ${releaseBranchName}: ${error.message}`);
